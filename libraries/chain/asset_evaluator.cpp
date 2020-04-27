@@ -45,6 +45,15 @@ namespace detail {
             "Asset extension reward percent must be less than 100% till HARDFORK_1774_TIME!");
       }
    }
+
+   void check_asset_claim_fees_hardfork_87_74_collatfee(const fc::time_point_sec& block_time, const asset_claim_fees_operation& op)
+   {
+      // HF_REMOVABLE: Following hardfork check should be removable after hardfork date passes:
+      FC_ASSERT( !op.extensions.claim_from_asset_id.valid() ||
+                 block_time >= HARDFORK_CORE_BSIP_87_74_COLLATFEE_TIME,
+                 "Collateral-denominated fees are not yet active and therefore cannot be claimed." );
+   }
+
 }
 
 void_result asset_create_evaluator::do_evaluate( const asset_create_operation& op )
@@ -926,10 +935,7 @@ void_result asset_claim_fees_evaluator::do_evaluate( const asset_claim_fees_oper
 { try {
    database& d = db();
 
-   // HF_REMOVABLE: Following hardfork check should be removable after hardfork date passes:
-   FC_ASSERT( !o.extensions.claim_from_asset_id.valid() ||
-              d.head_block_time() >= HARDFORK_CORE_BSIP_87_74_COLLATFEE_TIME,
-              "Collateral-denominated fees are not yet active and therefore cannot be claimed." );
+   detail::check_asset_claim_fees_hardfork_87_74_collatfee(d.head_block_time(), o); // HF_REMOVABLE
 
    const asset_object & container_asset = o.extensions.claim_from_asset_id.valid() ?
       (*o.extensions.claim_from_asset_id)(d) : o.amount_to_claim.asset_id(d);
