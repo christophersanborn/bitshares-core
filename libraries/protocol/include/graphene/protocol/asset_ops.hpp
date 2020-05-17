@@ -33,8 +33,9 @@ namespace graphene { namespace protocol {
       fc::optional<uint16_t>                  reward_percent;
       fc::optional<flat_set<account_id_type>> whitelist_market_fee_sharing;
       // After BSIP81 activation, taker_fee_percent is the taker fee
-      fc::optional<uint16_t>                  taker_fee_percent;
+      fc::optional<uint16_t> taker_fee_percent;
    };
+
    typedef extension<additional_asset_options> additional_asset_options_t;
 
    bool is_valid_symbol( const string& symbol );
@@ -103,10 +104,12 @@ namespace graphene { namespace protocol {
 
       struct ext
       {
+         fc::optional<uint16_t> margin_call_fee_ratio; // BSIP 74
          /// After BSIP77, when creating a new debt position or updating an existing position,
          /// the position will be checked against this parameter.
          /// Unused for prediction markets, although we allow it to be set for simpler implementation
-         fc::optional<uint16_t> initial_collateral_ratio;
+         fc::optional<uint16_t> initial_collateral_ratio;  // BSIP-77
+         fc::optional<uint16_t> force_settle_fee_percent;  // BSIP-87
       };
 
       /// Time before a price feed expires
@@ -562,7 +565,8 @@ FC_REFLECT( graphene::protocol::asset_options,
             (extensions)
           )
 
-FC_REFLECT( graphene::protocol::bitasset_options::ext, (initial_collateral_ratio) )
+FC_REFLECT( graphene::protocol::bitasset_options::ext, 
+      (margin_call_fee_ratio)(initial_collateral_ratio)(force_settle_fee_percent) )
 
 FC_REFLECT( graphene::protocol::bitasset_options,
             (feed_lifetime_sec)
@@ -579,6 +583,7 @@ FC_REFLECT( graphene::protocol::additional_asset_options,
 
 FC_REFLECT( graphene::protocol::asset_create_operation::fee_parameters_type,
             (symbol3)(symbol4)(long_symbol)(price_per_kbyte) )
+
 FC_REFLECT( graphene::protocol::asset_global_settle_operation::fee_parameters_type, (fee) )
 FC_REFLECT( graphene::protocol::asset_settle_operation::fee_parameters_type, (fee) )
 FC_REFLECT( graphene::protocol::asset_settle_cancel_operation::fee_parameters_type, )

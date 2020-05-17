@@ -410,9 +410,23 @@ namespace graphene { namespace chain {
           */
          ///@{
          int match( const limit_order_object& taker, const limit_order_object& maker, const price& trade_price );
+         /***
+          * @brief Match the two orders
+          * @param taker the account that is removing liquidity from the book
+          * @param maker the account that put liquidity on the book
+          * @param trade_price the price the trade should execute at
+          * @param feed_price the price of the current feed
+          * @param maintenance_collateral_ratio the maintenance collateral ratio
+          * @param maintenance_collateralization the maintenance collateralization
+          * @param max_short_squeeze_ratio Maximum short squeeze ratio
+          * @param margin_call_fee_ratio Margin call fee ratio
+          * @returns 0 if no orders were matched, 1 if taker was filled, 2 if maker was filled, 3 if both were filled
+          */
          int match( const limit_order_object& taker, const call_order_object& maker, const price& trade_price,
                     const price& feed_price, const uint16_t maintenance_collateral_ratio,
-                    const optional<price>& maintenance_collateralization );
+                    const optional<price>& maintenance_collateralization,
+                    const optional<uint16_t>& max_short_squeeze_ratio = {},
+                    const optional<uint16_t>& margin_call_fee_ratio = {});
          ///@}
 
          /// Matches the two orders, the first parameter is taker, the second is maker.
@@ -424,12 +438,29 @@ namespace graphene { namespace chain {
                    const price& fill_price);
 
          /**
+          * @brief fills limit order
+          * @param order the order
+          * @param pays what the account is paying
+          * @param receives what the account is receiving
+          * @param cull_if_small take care of dust
+          * @param fill_price the transaction price
+          * @param is_maker TRUE if this order is maker, FALSE if taker
           * @return true if the order was completely filled and thus freed.
           */
-         bool fill_limit_order( const limit_order_object& order, const asset& pays, const asset& receives, bool cull_if_small,
-                                const price& fill_price, const bool is_maker );
+         bool fill_limit_order( const limit_order_object& order, const asset& pays, const asset& receives, 
+               bool cull_if_small, const price& fill_price, const bool is_maker );
+         /***
+          * @brief attempt to fill a call order
+          * @param order the order
+          * @param pays what the buyer pays for the collateral
+          * @param receives the collateral received by the buyer
+          * @param fill_price the price the transaction executed at
+          * @param is_maker TRUE if the buyer is the maker, FALSE if the buyer is the taker
+          * @param margin_fee Margin call fees paid in collateral asset
+          * @returns TRUE if the order was completely filled
+          */
          bool fill_call_order( const call_order_object& order, const asset& pays, const asset& receives,
-                               const price& fill_price, const bool is_maker );
+                               const price& fill_price, const bool is_maker, const asset& margin_fee = asset(0) );
          bool fill_settle_order( const force_settlement_object& settle, const asset& pays, const asset& receives,
                                  const price& fill_price, const bool is_maker );
 
@@ -439,9 +470,16 @@ namespace graphene { namespace chain {
          // helpers to fill_order
          void pay_order( const account_object& receiver, const asset& receives, const asset& pays );
 
-         asset calculate_market_fee(const asset_object& recv_asset, const asset& trade_amount, const bool& is_maker);
+         /**
+          * @brief Calculate the market fee that is to be taken
+          * @param trade_asset the asset (passed in to avoid a lookup)
+          * @param trade_amount the quantity that the fee calculation is based upon
+          * @param is_maker TRUE if this is the fee for a maker, FALSE if taker
+          */
+         asset calculate_market_fee( const asset_object& trade_asset, const asset& trade_amount, const bool& is_maker);
          asset pay_market_fees(const account_object* seller, const asset_object& recv_asset, const asset& receives,
                                const bool& is_maker);
+         asset pay_force_settle_fees(const asset_object& collecting_asset, const asset& collat_receives);
          ///@}
 
 
@@ -626,6 +664,20 @@ namespace graphene { namespace chain {
          const chain_property_object*           _p_chain_property_obj      = nullptr;
          const witness_schedule_object*         _p_witness_schedule_obj    = nullptr;
          ///@}
+         protected:
+         /***
+          * Get the correct max_short_squeeze_price from the price_feed based on chain time
+          * (due to hardfork changes in the calculation)
+          * @param head_block_time The chain's current block time
+          * @param next_maintenance_time The chain's next maintenance time
+          * @param feed the debt asset's price feed
+          * @param margin_call_fee_ratio The MCFR for the debt asset in the respective price feed
+          * @returns the max short squeeze price
+          */
+         price get_max_short_squeeze_price(const fc::time_point_sec& head_block_time,
+                                           const fc::time_point_sec& next_maintenance_time,
+                                           const price_feed& feed,
+                                           const fc::optional<uint16_t> margin_call_fee_ratio = {}) const;
    };
 
    namespace detail
@@ -648,3 +700,22 @@ namespace graphene { namespace chain {
    }
 
 } }
+
+namespace graphene {
+   namespace chain {
+      namespace detail {
+         // TODO: BSIP74: Move calculate_collateral() near get_max_squeeze_ratio() or vice versa
+         /**
+          * @brief Calculate the collateral from filled_debt * ratio_divisor / price
+          * @param debt The amount of debt filled
+          * @param ratio_divisor Ratio divisor of the price
+          * @param reference_price Reference price
+          * @returns The collateral corresponding from the reference price and the divisor
+          */
+         asset calculate_collateral(const asset &filled_debt,
+                                    const uint16_t &ratio_divisor,
+                                    const price &reference_price);
+      }
+
+   }
+}
