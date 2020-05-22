@@ -716,7 +716,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          BOOST_CHECK_EQUAL(get_balance(alice, core),
                            alice_initial_core.amount.value + expected_payment_to_alice_core.amount.value);
 
-         // Check Alice's limit order is still open
+         // Check Alice's limit order is close
          BOOST_CHECK(!db.find(alice_order_id));
 
          // Check Bob's debt position is closed
@@ -938,7 +938,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          BOOST_CHECK_EQUAL(alice_initial_cr.quote.amount.value, 5000000); // Debt of 5,000,000 satoshi SMARTBIT
 
          //////
-         // Bob transfers hist SMARTBIT to Charlie to clarify the accounting
+         // Bob transfers his SMARTBIT to Charlie to clarify the accounting
          //////
          transfer(bob_id, charlie_id, bob_initial_smart);
          BOOST_CHECK_EQUAL(get_balance(bob_id, smartbit_id), 0 * SMARTBIT_UNIT);
@@ -1040,6 +1040,11 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // Alice's fill order for her limit order should have zero fee
          fill_order_operation alice_fill_op = histories.front().op.get<fill_order_operation>();
          BOOST_CHECK(alice_fill_op.fee == asset(0));
+         // Alice's fill order's fill price should equal the expected match price
+         // Alice's alice_order_price_implied differs slightly from alice_sell_op.get_price()
+         // due to rounding in this test while creating the parameters for the limit order
+         const price expected_match_price = alice_sell_op.get_price();
+         BOOST_CHECK(alice_fill_op.fill_price == expected_match_price);
 
          // Check Bob's history
          histories = hist_api.get_account_history_operations(
@@ -1049,6 +1054,8 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // Bob's fill order for his margin call should have a fee equal to the margin call fee
          fill_order_operation bob_fill_op = histories.front().op.get<fill_order_operation>();
          BOOST_CHECK(bob_fill_op.fee == expected_margin_call_fee_from_bob_debt_core);
+         // Bob's fill order's fill price should equal the expected match price
+         BOOST_CHECK(bob_fill_op.fill_price == expected_match_price);
 
       } FC_LOG_AND_RETHROW()
    }
