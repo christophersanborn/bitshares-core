@@ -531,10 +531,10 @@ bool database::apply_order(const limit_order_object& new_order_object, bool allo
    bool to_check_call_orders = false;
    const asset_object& sell_asset = sell_asset_id( *this );
    const asset_bitasset_data_object* sell_abd = nullptr;
-   price call_match_price;  // Price at which margin calls sit on the books. Prior to BSIP-74 this price
-                            // is equal to the MSSP. After, it may deviate from MSSP due to MCFR.
-   price call_pays_price;   // Price margin call actually pays collateral at. It is higher than
-                            // call_match_price if there is a Margin Call Fee. This price equals the MSSP.
+   price call_match_price;  // Price at which margin calls sit on the books. Prior to BSIP-74 this price is
+                            // same as the MSSP. After, it is the MCOP, which may deviate from MSSP due to MCFR.
+   price call_pays_price;   // Price margin call actually relinquishes collateral at. Equals the MSSP and it may
+                            // differ from call_match_price if there is a Margin Call Fee.
    if( sell_asset.is_market_issued() )
    {
       sell_abd = &sell_asset.bitasset_data( *this );
@@ -548,11 +548,11 @@ bool database::apply_order(const limit_order_object& new_order_object, bool allo
             call_pays_price = call_match_price;
          } else {
             call_match_price = ~sell_abd->current_feed.
-               margin_call_offer_price(sell_abd->options.extensions.value.margin_call_fee_ratio);
+               margin_call_order_price(sell_abd->options.extensions.value.margin_call_fee_ratio);
             call_pays_price = ~sell_abd->current_feed.max_short_squeeze_price();
          }
-         if( ~new_order_object.sell_price <= call_match_price ) // new limit order price is good enough to match a call
-            to_check_call_orders = true;
+         if( ~new_order_object.sell_price <= call_match_price ) // If new limit order price is good enough to
+            to_check_call_orders = true;                        // match a call, then check if there are calls.
       }
    }
 
@@ -1188,7 +1188,7 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
     // stop when limit orders are selling too little USD for too much CORE
     auto min_price = ( before_core_hardfork_1270 ?
                          bitasset.current_feed.max_short_squeeze_price_before_hf_1270()
-                       : bitasset.current_feed.margin_call_offer_price(bitasset.options
+                       : bitasset.current_feed.margin_call_order_price(bitasset.options
                                                                        .extensions.value.margin_call_fee_ratio) );
     //// BSIP74: Change the min_price = feed_price / (MSSR-MCFR) (instead of the previous feed_price / MSSR)
     //auto min_price = get_max_short_squeeze_price(head_block_time(), maint_time, bitasset.current_feed,

@@ -281,12 +281,17 @@ namespace graphene { namespace protocol {
                  / asset( static_cast<int64_t>(cp.denominator()), settlement_price.quote.asset_id ) );
       }
 
+
+      // Documentation in header.
+      // Calculation:  MSSP = settlement_price / MSSR
       price price_feed::max_short_squeeze_price()const
       {
          return settlement_price * ratio_type( GRAPHENE_COLLATERAL_RATIO_DENOM, maximum_short_squeeze_ratio );
       }
 
-      price price_feed::margin_call_offer_price(const fc::optional<uint16_t> maybe_mcfr)const
+      // Documentation in header.
+      // Calculation:  MCOP = settlement_price / (MSSR-MCFR)
+      price price_feed::margin_call_order_price(const fc::optional<uint16_t> maybe_mcfr)const
       {
          const uint16_t mcfr = maybe_mcfr.valid() ? *maybe_mcfr : 0;
          uint16_t numerator = (mcfr < maximum_short_squeeze_ratio) ?
