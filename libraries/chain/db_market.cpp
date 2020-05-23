@@ -45,55 +45,6 @@ namespace detail {
       return static_cast<int64_t>(a);
    }
 
-   share_type calculate_ratio( const share_type& value, uint16_t ratio)
-   {
-      fc::uint128_t a(value.value);
-      a *= (ratio > GRAPHENE_COLLATERAL_RATIO_DENOM) ? (ratio-GRAPHENE_COLLATERAL_RATIO_DENOM) : 0; // Avoid underflows
-      a /= GRAPHENE_COLLATERAL_RATIO_DENOM;
-      return static_cast<int64_t>(a);
-   }
-
-   asset calculate_collateral(const asset &filled_debt, const uint16_t &ratio_divisor, const price &reference_price) {
-      return calculate_collateral(filled_debt, reference_price, GRAPHENE_COLLATERAL_RATIO_DENOM, ratio_divisor);
-   }
-
-   asset calculate_collateral(const asset &filled_debt,
-                              const price &reference_price,
-                              const uint16_t &ratio_dividend, const uint16_t &ratio_divisor) {
-      // collateral = filled_debt / (price * ratio_dividend / ratio_divisor)
-      //            = filled_debt * (ratio_divisor / (price * ratio_dividend))
-
-      // Edge case of zero ratio divisor
-      if (ratio_divisor == 0) {
-         if( filled_debt.asset_id == reference_price.base.asset_id )
-         {
-            return asset(0, reference_price.quote.asset_id );
-         }
-         else if( filled_debt.asset_id == reference_price.quote.asset_id )
-         {
-            return asset(0, reference_price.base.asset_id );
-         }
-         FC_THROW_EXCEPTION( fc::assert_exception, "incompatible calculate_collateral",
-                             ("filled_debt", filled_debt)("reference_price", reference_price) );
-      }
-
-      // The arithmetic expects that the asset type of the denominator of the price (quote of the price object)
-      // is the same as the asset type of the filled_debt.
-      price a;
-      if (filled_debt.asset_id == reference_price.base.asset_id) {
-         a = reference_price * ratio_type(ratio_dividend, ratio_divisor);
-      } else {
-         a = reference_price * ratio_type(ratio_divisor, ratio_dividend);
-      }
-
-      // The multiply_and_round_up function intelligently corrects the multiplication by inverting the price
-      // if necessary to ensure that the asset type of a's denominator is the same as that of filled_debt
-      asset fee = filled_debt.multiply_and_round_up(a);
-
-      return fee;
-
-   }
-
 } //detail
 
 /**
@@ -1147,7 +1098,9 @@ bool database::fill_settle_order( const force_settlement_object& settle, const a
  *  @param mia - the market issued asset that should be called.
  *  @param enable_black_swan - when adjusting collateral, triggering a black swan is invalid and will throw
  *                             if enable_black_swan is not set to true.
- *  @param for_new_limit_order - true if this function is called when matching call orders with a new limit order
+ *  @param for_new_limit_order - true if this function is called when matching call orders with a new
+ *     limit order. (Only relevent before hardfork 625. apply_order_before_hardfork_625() is only
+ *     function that calls this with for_new_limit_order true.)
  *  @param bitasset_ptr - an optional pointer to the bitasset_data object of the asset
  *
  *  @return true if a margin call was executed.
@@ -1183,16 +1136,16 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
 
     bool before_core_hardfork_1270 = ( maint_time <= HARDFORK_CORE_1270_TIME ); // call price caching issue
 
-    // looking for limit orders selling the most USD for the least CORE
+    // Looking for limit orders selling the most USD for the least CORE.
     auto max_price = price::max( mia.id, bitasset.options.short_backing_asset );
-    // stop when limit orders are selling too little USD for too much CORE
+    // Stop when limit orders are selling too little USD for too much CORE.
+    // Note that since BSIP74, margin calls offer somewhat less CORE per USD
+    // if the issuer claims a Margin Call Fee.
     auto min_price = ( before_core_hardfork_1270 ?
                          bitasset.current_feed.max_short_squeeze_price_before_hf_1270()
-                       : bitasset.current_feed.margin_call_order_price(bitasset.options
-                                                                       .extensions.value.margin_call_fee_ratio) );
-    //// BSIP74: Change the min_price = feed_price / (MSSR-MCFR) (instead of the previous feed_price / MSSR)
-    //auto min_price = get_max_short_squeeze_price(head_block_time(), maint_time, bitasset.current_feed,
-    //                                             bitasset.options.extensions.value.margin_call_fee_ratio);
+                       : bitasset.current_feed.margin_call_order_price(
+                                      bitasset.options.extensions.value.margin_call_fee_ratio )
+                     );
 
     // NOTE limit_price_index is sorted from greatest to least
     auto limit_itr = limit_price_index.lower_bound( max_price );
@@ -1225,7 +1178,7 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
     }
 
     bool filled_limit = false;
-    bool margin_called = false;
+    bool margin_called = false;         // toggles true once/if we actually execute a margin call
 
     auto head_time = head_block_time();
     auto head_num = head_block_num();
@@ -1255,9 +1208,16 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
           return margin_called;
 
        const limit_order_object& limit_order = *limit_itr;
-       // BSIP74: The match_price for call orders remains at the limit order price
+
        price match_price  = limit_order.sell_price;
        // There was a check `match_price.validate();` here, which is removed now because it always passes
+       price call_pays_price = match_price * bitasset.current_feed.margin_call_pays_ratio(
+                                                bitasset.options.extensions.value.margin_call_fee_ratio);
+       // Since BSIP74, the call "pays" a bit more collateral per debt than the match price, with the
+       // excess being kept by the asset issuer as a margin call fee. In what follows, we use
+       // call_pays_price for the black swan check, and for the TCR, but we still use the match_price,
+       // of course, to determine what the limit order receives.  Note margin_call_pays_ratio() returns
+       // 1/1 if margin_call_fee_ratio is unset (i.e. before BSIP74), so hardfork check is implicit.
 
        // Old rule: margin calls can only buy high https://github.com/bitshares/bitshares-core/issues/606
        if( before_core_hardfork_606 && match_price > ~call_order.call_price )
@@ -1265,8 +1225,13 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
 
        margin_called = true;
 
+       // Although we checked for black swan above, we do one more check to ensure the call order can
+       // pay the amount of collateral which we intend to take from it (including margin call fee).  I
+       // guess this is just a sanity check, as, I'm not sure how we'd get here without it being
+       // detected in the prior swan check, aside perhaps for rounding errors. Or maybe there was some
+       // way prior to hf_1270.
        auto usd_to_buy = call_order.get_debt();
-       if( usd_to_buy * match_price > call_order.get_collateral() )
+       if( usd_to_buy * call_pays_price > call_order.get_collateral() )
        {
           elog( "black swan detected on asset ${symbol} (${id}) at block ${b}",
                 ("id",mia.id)("symbol",mia.symbol)("b",head_num) );
@@ -1278,14 +1243,14 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
 
        if( !before_core_hardfork_1270 )
        {
-          usd_to_buy.amount = call_order.get_max_debt_to_cover( match_price,
+          usd_to_buy.amount = call_order.get_max_debt_to_cover( call_pays_price,
                                                                 bitasset.current_feed.settlement_price,
                                                                 bitasset.current_feed.maintenance_collateral_ratio,
                                                                 bitasset.current_maintenance_collateralization );
        }
        else if( !before_core_hardfork_834 )
        {
-          usd_to_buy.amount = call_order.get_max_debt_to_cover( match_price,
+          usd_to_buy.amount = call_order.get_max_debt_to_cover( call_pays_price,
                                                                 bitasset.current_feed.settlement_price,
                                                                 bitasset.current_feed.maintenance_collateral_ratio );
        }
@@ -1295,6 +1260,7 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
        if( usd_to_buy > usd_for_sale )
        {  // fill order
           limit_receives  = usd_for_sale * match_price; // round down, in favor of call order
+          call_pays       = usd_for_sale * call_pays_price; // (same as match_price until BSIP-74)
 
           // Be here, the limit order won't be paying something for nothing, since if it would, it would have
           //   been cancelled elsewhere already (a maker limit order won't be paying something for nothing):
@@ -1321,9 +1287,13 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
           if( before_core_hardfork_342 )
           {
              limit_receives = usd_to_buy * match_price; // round down, in favor of call order
-          }
-          else
+             call_pays = limit_receives;
+          } else {
              limit_receives = usd_to_buy.multiply_and_round_up( match_price ); // round up, in favor of limit order
+             call_pays      = usd_to_buy.multiply_and_round_up( call_pays_price ); // BSIP74; excess is fee.
+                                              // Note: TODO: Due to different rounding, couldn't this potentialy be
+                                              // one satoshi more than the blackswan check above? Can this bite us?
+          }
 
           filled_call    = true; // this is safe, since BSIP38 (hard fork core-834) depends on BSIP31 (hard fork core-343)
 
@@ -1336,52 +1306,28 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
                 _issue_453_affected_assets.insert( bitasset.asset_id );
           }
        }
+       limit_pays = call_receives;
 
        // BSIP74: Margin call fee
-       asset margin_call_fee = asset(0, bitasset.options.short_backing_asset);
-       if (head_block_time() <= HARDFORK_CORE_BSIP74_TIME) {
-          call_pays = limit_receives;
-       } else {
-          // BSIP74: Call receives whatever was calculated above
-          // BSIP74: Limit order receives whatever was calculate above per BSIP32
+       FC_ASSERT(call_pays >= limit_receives);
+       const asset margin_call_fee = call_pays - limit_receives;
 
-          // BSIP74: Call order must pay (X*(MCFR/(MSSR-MCFR))/limit_order_price)
-          uint16_t mssr = bitasset.current_feed.maximum_short_squeeze_ratio; // TODO: BSIP75 should update this line
-          optional<uint16_t> mcfr_opt = bitasset.options.extensions.value.margin_call_fee_ratio;
-          const uint16_t mcfr = mcfr_opt.valid() ? *mcfr_opt : 0;
-          margin_call_fee = graphene::chain::detail::calculate_collateral(call_receives,
-                                                                          match_price,
-                                                                          (mssr-mcfr), mcfr);
-          FC_ASSERT(margin_call_fee.asset_id == bitasset.options.short_backing_asset);
-
-          // Safeguard against the call order paying more than MSSR
-          const asset max_call_pays = graphene::chain::detail::calculate_collateral(call_receives, mssr,
-                                                                    bitasset.current_feed.settlement_price);
-          call_pays = limit_receives + margin_call_fee;
-          if (call_pays > max_call_pays) {
-             // Cap the margin call fee
-             call_pays = max_call_pays;
-             margin_call_fee = max_call_pays - limit_receives;
-          }
-
-          if (call_pays != limit_receives) {
-             wdump((""));
-             wdump((""));
-             wdump(("BSIP74 Diff A2")(call_pays)(limit_receives)((call_pays - limit_receives))(margin_call_fee));
-             wdump((""));
-             wdump((""));
-          }
+       if (call_pays != limit_receives) { // TEMP: REMOVE
+          wdump((""));
+          wdump((""));
+          wdump(("BSIP74 Diff A2")(call_pays)(limit_receives)((call_pays - limit_receives))(margin_call_fee));
+          wdump((""));
+          wdump((""));
        }
-       limit_pays = call_receives;
 
        if( filled_call && before_core_hardfork_343 )
           ++call_price_itr;
+
        // when for_new_limit_order is true, the call order is maker, otherwise the call order is taker
        // BSIP74: Pass the calculated margin call fee into fill_call_order()
-       // Margin call fee should equal = X*MCFR/price
-       // but rounding errors of one or two satoshi is less precise than calculating the direct delta
-       FC_ASSERT(call_pays >= limit_receives);
+       // Margin call fee should equal = X*MCFR/match_price, to within rounding error.
        fill_call_order( call_order, call_pays, call_receives, match_price, for_new_limit_order, margin_call_fee);
+
        if( !before_core_hardfork_1270 )
           call_collateral_itr = call_collateral_index.lower_bound( call_min );
        else if( !before_core_hardfork_343 )
@@ -1389,7 +1335,8 @@ bool database::check_call_orders( const asset_object& mia, bool enable_black_swa
 
        auto next_limit_itr = std::next( limit_itr );
        // when for_new_limit_order is true, the limit order is taker, otherwise the limit order is maker
-       bool really_filled = fill_limit_order( limit_order, limit_pays, limit_receives, true, match_price, !for_new_limit_order );
+       bool really_filled = fill_limit_order( limit_order, limit_pays, limit_receives, true,
+                                              match_price, !for_new_limit_order );
        if( really_filled || ( filled_limit && before_core_hardfork_453 ) )
           limit_itr = next_limit_itr;
 

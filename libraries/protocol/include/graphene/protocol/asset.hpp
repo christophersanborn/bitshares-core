@@ -248,12 +248,33 @@ namespace graphene { namespace protocol {
        * concept of MSSP, as it communicates the minimum collateralization before black swan may be
        * triggered, but we add this new method to calculate MCOP.
        *
+       * Note that when we calculate the MCOP, we enact a price floor to ensure the margin call never
+       * offers LESS collateral than the DEBT is worth. As such, it's important to calculate the
+       * realized fee, when trading at the offer price, as a delta between total relinquished collateral
+       * (DEBT*MSSP) and collateral sold to the buyer (DEBT*MCOP).  If you instead try to calculate the
+       * fee by direct multiplication of MCFR, you will get the wrong answer if the price was
+       * floored. (Fee is truncated when price is floored.)
+       *
        * @param margin_call_fee_ratio MCFR value currently in effect. If zero or unset, returns
        *    same result as @ref max_short_squeeze_price().
        *
        * @return The MCOP in units of DEBT per COLLATERAL.
        */
       price margin_call_order_price(const fc::optional<uint16_t> margin_call_fee_ratio)const;
+
+      /**
+       * Ratio between max_short_squeeze_price and margin_call_order_price.  When a margin call is
+       * taker, matching an existing order on the books, it is possible the call gets a better realized
+       * price than the order price that it offered at.  In this case, the margin call fee is
+       * proportionaly reduced. This ratio is used to calculate the price at which the call relinquishes
+       * collateral (to meet both trade and fee obligations) based on actual realized match price.
+       *
+       * This function enacts the same flooring as margin_call_order_price() (MSSR - MCFR is floored at
+       * 1.00).  This ensures we apply the same fee truncation in the taker case as the maker case.
+       *
+       * @return (MSSR - MCFR) / MSSR
+       */
+      ratio_type margin_call_pays_ratio(const fc::optional<uint16_t> margin_call_fee_ratio)const;
 
       /// Call orders with collateralization (aka collateral/debt) not greater than this value are in margin call territory.
       /// Calculation: ~settlement_price * maintenance_collateral_ratio / GRAPHENE_COLLATERAL_RATIO_DENOM
