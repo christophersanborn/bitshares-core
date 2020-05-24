@@ -611,7 +611,7 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
                              1450); // GRAPHENE_DEFAULT_MAX_SHORT_SQUEEZE_RATIO - smartbit_margin_call_fee_ratio
          const price expected_match_price = intermediate_feed_price * ratio_type(GRAPHENE_COLLATERAL_RATIO_DENOM,
                                                                                  ratio_numerator);
-         // Reduces to (17 satoshi SMARTIT / 400 satoshi CORE) * (1000 / 1450)
+         // Reduces to (17 satoshi SMARTBIT / 400 satoshi CORE) * (1000 / 1450)
          // = (17 satoshi SMARTBIT / 400 satoshi CORE) * (100 / 145)
          // = (17 satoshi SMARTBIT / 4 satoshi CORE) * (1 / 145)
          // = 17 satoshi SMARTBIT / 580 satoshi CORE
@@ -748,6 +748,8 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // Alice's fill order for her limit order should have zero fee
          fill_order_operation alice_fill_op = histories.front().op.get<fill_order_operation>();
          BOOST_CHECK(alice_fill_op.fee == asset(0));
+         // Alice's fill order's fill price should equal the expected match price
+         BOOST_CHECK(~alice_fill_op.fill_price == expected_match_price);
 
          // Check Bob's history
          histories = hist_api.get_account_history_operations(
@@ -757,6 +759,8 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
          // Bob's fill order for his margin call should have a fee equal to the margin call fee
          fill_order_operation bob_fill_op = histories.front().op.get<fill_order_operation>();
          BOOST_CHECK(bob_fill_op.fee == expected_margin_call_fee);
+         // Bob's fill order's fill price should equal the expected match price
+         BOOST_CHECK(~bob_fill_op.fill_price == expected_match_price);
 
       } FC_LOG_AND_RETHROW()
    }
