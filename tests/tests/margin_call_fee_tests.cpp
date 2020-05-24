@@ -767,6 +767,351 @@ BOOST_FIXTURE_TEST_SUITE(margin_call_fee_tests, bitasset_database_fixture)
 
 
    /**
+    * Test a scenario of a partial Filling of a Call Order as a Maker after HF
+    * where the partial filling is due to call order defining a target collateral ratio (TCR) (BSIP38)
+    *
+    * 0. Advance to HF
+    * 1. Initialize actors and a smart asset called SMARTBIT
+    * 2. Publish feed
+    * 3. (Order 1: Call order) Bob borrows a **"small"** amount of SMARTBIT into existence.
+    *     Bob retains the asset in his own balances, or transfers it, or sells it is not critical
+    *     because his debt position is what will be tracked.
+    * 4. The feed price is updated to indicate that the collateral drops enough to trigger a margin call
+    *    **but not enough** to trigger a global settlement.
+    *    Bob's activated margin call cannot be matched against any existing limit order's price.
+    * 5. (Order 2: Limit order) Alice places a **"large"** limit order to sell SMARTBIT at a price
+    *    that will overlap with Bob's "activated" call order / margin call.
+    *    **Bob should be charged as a maker, and Alice as a taker.**
+    *    Alice's limit order should be (partially or completely) filled,
+    *    but Bob's order will also only be partially filled because the TCR will sell just enough collateral
+    *    so that the remaining CR of the debt position >= TCR.
+    *    Bob's debt position should remain open.
+    */
+   BOOST_AUTO_TEST_CASE(target_cr_partial_fill_of_call_order_as_maker) {
+      try {
+         //////
+         // 0. Advance to activate hardfork
+         //////
+         BOOST_TEST_MESSAGE("Advancing past Hardfork BSIP74");
+         generate_blocks(HARDFORK_CORE_BSIP74_TIME);
+         generate_block();
+         set_expiration(db, trx);
+
+
+         //////
+         // 1. Initialize actors and a smart asset called SMARTBIT
+         //////
+         // Initialize for the current time
+         trx.clear();
+         set_expiration(db, trx);
+
+         // Initialize actors
+         ACTORS((alice)(bob));
+         ACTORS((smartissuer)(feedproducer));
+
+         // Initialize tokens
+         // CORE asset exists by default
+         const asset_object &core = asset_id_type()(db);
+         const asset_id_type core_id = core.id;
+         const int64_t CORE_UNIT = asset::scaled_precision(core.precision).value; // 100000 satoshi CORE in 1 CORE
+
+         // Create the SMARTBIT asset
+         const int16_t SMARTBIT_UNIT = 10000; // 10000 satoshi SMARTBIT in 1 SMARTBIT
+         const uint16_t smartbit_market_fee_percent = 2 * GRAPHENE_1_PERCENT;
+         const uint16_t smartbit_margin_call_fee_ratio = 50; // 5% expressed in terms of GRAPHENE_COLLATERAL_RATIO_DENOM
+         // Define the margin call fee ratio
+         create_bitasset("SMARTBIT", smartissuer.id, smartbit_market_fee_percent, charge_market_fee, 4, core_id,
+                         GRAPHENE_MAX_SHARE_SUPPLY, {}, smartbit_margin_call_fee_ratio);
+         // Obtain asset object after a block is generated to obtain the final object that is commited to the database
+         generate_block();
+         const asset_object smartbit = get_asset("SMARTBIT");
+         const asset_id_type smartbit_id = smartbit.id;
+         update_feed_producers(smartbit, {feedproducer.id});
+
+         // Initialize token balance of actors
+         // Alice should start with 5,000,000 CORE
+         const asset alice_initial_core = asset(5000000 * CORE_UNIT);
+         transfer(committee_account, alice.id, alice_initial_core);
+         BOOST_REQUIRE_EQUAL(get_balance(alice_id, core_id), alice_initial_core.amount.value);
+
+         // Bob should start with enough CORE to back 200 SMARTBIT subject to
+         // (a) to an initial price feed of 1 satoshi SMARTBIT for 20 satoshi CORE
+         // = 0.0001 SMARTBIT for 0.00020 CORE = 1 SMARTBIT for 2 CORE
+         // (b) an initial collateral ratio of 2x
+         const price initial_feed_price =
+                 smartbit.amount(1) / core.amount(20); // 1 satoshi SMARTBIT for 20 satoshi CORE
+         const asset bob_initial_smart = smartbit.amount(200 * SMARTBIT_UNIT); // 2,000,000 satoshi SMARTBIT
+         const asset bob_initial_core = core.amount(
+                 2 * (bob_initial_smart * initial_feed_price).amount); // 80,000,000 satoshi CORE
+         transfer(committee_account, bob.id, bob_initial_core);
+         BOOST_REQUIRE_EQUAL(get_balance(bob, core), 80000000);
+
+
+         //////
+         // 2. Publish feed
+         //////
+         price_feed current_feed;
+         current_feed.settlement_price = initial_feed_price;
+         current_feed.maintenance_collateral_ratio = 1750; // MCR of 1.75x
+         current_feed.maximum_short_squeeze_ratio = 1500; // MSSR of 1.50x
+         publish_feed(smartbit, feedproducer, current_feed);
+         FC_ASSERT(smartbit.bitasset_data(db).current_feed.settlement_price == current_feed.settlement_price);
+
+
+         //////
+         // 3. (Order 1: Call order) Bob borrows a **"small"** amount of SMARTBIT into existence.
+         //    Bob retains the asset in his own balances, or transfers it, or sells it is not critical
+         //    because his debt position is what will be tracked.
+         //////
+         const uint16_t tcr = 2200; // Bob's target collateral ratio (TCR) 220% expressed in terms of GRAPHENE_COLLATERAL_RATIO_DENOM
+         call_order_id_type bob_call_id = (*borrow(bob, bob_initial_smart, bob_initial_core, tcr)).id;
+         BOOST_REQUIRE_EQUAL(get_balance(bob, smartbit), 200 * SMARTBIT_UNIT);
+         BOOST_CHECK(!smartbit.bitasset_data(db).has_settlement()); // No global settlement
+         const price bob_initial_cr = bob_call_id(db).collateralization(); // Units of collateral / debt
+         BOOST_CHECK_EQUAL(bob_initial_cr.base.amount.value, 80000000); // Collateral of 80,000,000 satoshi CORE
+         BOOST_CHECK_EQUAL(bob_initial_cr.quote.amount.value, 2000000); // Debt of 2,000,000 satoshi SMARTBIT
+
+
+         //////
+         // 4. The feed price is updated to indicate that the collateral drops enough to trigger a margin call
+         //    **but not enough** to trigger a global settlement.
+         //    Bob's activated margin call cannot be matched against any existing limit order's price.
+         //////
+         // Adjust the price such that the initial CR of Bob's position (CR_0) drops to 1.7x = (17/10)x
+         // Want new price = 1.7 / CR_0 = (17/10) / CR_0
+         //
+         // Collateral ratios are defined as collateral / debt
+         // BitShares prices are conventionally defined as debt / collateral
+         // The new price can be expressed with the available codebase as
+         // = (17/10) * ~CR_0 = ~CR_0 * (17/10)
+         const price intermediate_feed_price = ~bob_initial_cr * ratio_type(17, 10); // Units of debt / collateral
+         // Reduces to (2000000 * 17) / (80000000 * 10) = (17) / (40 * 10) = 17 / 400
+         BOOST_CHECK(intermediate_feed_price < initial_feed_price);
+         BOOST_CHECK_EQUAL(intermediate_feed_price.base.amount.value, 17); // satoshi SMARTBIT
+         BOOST_CHECK_EQUAL(intermediate_feed_price.quote.amount.value, 400); // satoshi CORE
+
+         current_feed.settlement_price = intermediate_feed_price;
+         publish_feed(smartbit, feedproducer, current_feed);
+
+         BOOST_CHECK(smartbit.bitasset_data(db).current_feed.settlement_price == current_feed.settlement_price);
+         BOOST_CHECK(!smartbit.bitasset_data(db).has_settlement()); // No global settlement
+
+         // Check Bob's debt to the blockchain
+         BOOST_CHECK_EQUAL(bob_call_id(db).debt.value, bob_initial_smart.amount.value);
+         BOOST_CHECK_EQUAL(bob_call_id(db).collateral.value, bob_initial_core.amount.value);
+
+         // Check Bob's balances
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), smartbit_id(db)), bob_initial_smart.amount.value);
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), core_id(db)), 0);
+
+
+
+         //////
+         // 5. (Order 2: Limit order) Alice places a **"large"** limit order to sell SMARTBIT at a price
+         //    that will overlap with Bob's "activated" call order / margin call.
+         //    **Bob should be charged as a maker, and Alice as a taker.**
+         //    Alice's limit order should be (partially or completely) filled,
+         //    but Bob's order will also only be partially filled because the TCR will sell just enough collateral
+         //    so that the remaining CR of the debt position >= TCR.
+         //    Bob's debt position should remain open.
+         //////
+         // Alice obtains her SMARTBIT from Bob
+         transfer(bob_id, alice_id, bob_initial_smart);
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), smartbit_id(db)), 0);
+         BOOST_CHECK_EQUAL(get_balance(alice_id(db), smartbit_id(db)), bob_initial_smart.amount.value);
+
+         // The margin call should be priced at feed_price / (MSSR-MCFR)
+         // where feed_price is expressed as debt / collateral
+         // Create a "large" sell order at a "high" price of feed_price * 1.1 = feed_price * (11/10)
+         const price alice_order_price_implied = intermediate_feed_price * ratio_type(11, 10);
+
+
+         const asset alice_debt_to_sell = smartbit.amount(get_balance(alice_id(db), smartbit_id(db)));
+         // multiply_and_round_up() handles inverting the price so that the output is in correct collateral units
+         const asset alice_collateral_to_buy = alice_debt_to_sell.multiply_and_round_up(alice_order_price_implied);
+         limit_order_create_operation alice_sell_op = create_sell_operation(alice_id, alice_debt_to_sell,
+                                                                            alice_collateral_to_buy);
+         trx.clear();
+         trx.operations.push_back(alice_sell_op);
+         // asset alice_sell_fee = db.current_fee_schedule().set_fee(trx.operations.back());
+         sign(trx, alice_private_key);
+         processed_transaction ptx = PUSH_TX(db, trx); // No exception should be thrown
+         limit_order_id_type alice_order_id = ptx.operation_results[0].get<object_id_type>();
+
+         // The match price should be the settlement_price/(MSSR-MCFR) = feed_price/(MSSR-MCFR)
+         const uint16_t ratio_numerator = current_feed.maximum_short_squeeze_ratio - smartbit_margin_call_fee_ratio;
+         BOOST_REQUIRE_EQUAL(ratio_numerator,
+                             1450); // GRAPHENE_DEFAULT_MAX_SHORT_SQUEEZE_RATIO - smartbit_margin_call_fee_ratio
+         const price expected_match_price = intermediate_feed_price * ratio_type(GRAPHENE_COLLATERAL_RATIO_DENOM,
+                                                                                 ratio_numerator);
+         // Reduces to (17 satoshi SMARTBIT / 400 satoshi CORE) * (1000 / 1450)
+         // = (17 satoshi SMARTBIT / 400 satoshi CORE) * (100 / 145)
+         // = (17 satoshi SMARTBIT / 4 satoshi CORE) * (1 / 145)
+         // = 17 satoshi SMARTBIT / 580 satoshi CORE
+         BOOST_CHECK_EQUAL(expected_match_price.base.amount.value, 17); // satoshi SMARTBIT
+         BOOST_CHECK_EQUAL(expected_match_price.quote.amount.value, 580); // satoshi CORE
+
+         // When a TCR is set for a call order, the ideal is to not sell all of the collateral
+         // but only enough collateral so that the remaining collateral and the remaining debt in the debt position
+         // has a resulting CR >= TCR.  The specifications are described in BSIP38.
+         //
+         // Per BSIP38, the expected amount to sell from the call order is
+         // max_amount_to_sell = (debt * target_CR - collateral * feed_price) / (target_CR * match_price - feed_price)
+         //
+         // HOWEVER, the match price that is used in this calculation
+         // NEEDS TO BE ADJUSTED to account for the extra MCFR > 0 that will be paid by the call order.
+         // Rather than using a match price of feed_price/(MSSR-MCFR),
+         // the call_pays_price of feed_price/(MSSR-MCFR+MCFR) = feed_price/MSSR should be used when determing the
+         // amount of collateral and debt that will removed from the debt position.
+         // The limit order will still be compensated based on the normal match price of feed_price/(MSSR-MCFR)
+         // but the calculation from BSIP38 should use the call_pays_price which reflects that the call order
+         // will actually pay more collateral
+         // (it can be considered as a higher effective price when denominated in collateral / debt,
+         // or equivalently a lower effective price when denominated in debt / collateral).
+
+         // Therefore, the effective match price, or the call_pays_price, = feed_price / MSSR reduces to
+         // feed_price / MSSR = (17 satoshi SMARTBIT / 400 satoshi CORE) * (1000 / 1500)
+         //                   =  (17 satoshi SMARTBIT / 400 satoshi CORE) * (10 / 15)
+         //                   =  17 satoshi SMARTBIT / 600 satoshi CORE
+
+         // Returning to the formula for the TCR amount to sell from the call order
+         // max_amount_to_sell = (debt * target_CR - collateral * feed_price) / (target_CR * call_pays_price - feed_price)
+         //
+         // = (2000000 satoshi SMARTBIT * [2200 / 1000] - 80000000 satoshi CORE * [17 satoshi SMARTBIT / 400 satoshi CORE])
+         //   / ([2200 / 1000] *  [17 satoshi SMARTBIT / 600 satoshi CORE] - [17 satoshi SMARTBIT / 400 satoshi CORE])
+         //
+         // = (2000000 satoshi SMARTBIT * [22 / 10] - 80000000 satoshi SMARTBIT * [17 / 400])
+         //   / ([22 / 10] *  [17 satoshi SMARTBIT / 600 satoshi CORE] - [17 satoshi SMARTBIT / 400 satoshi CORE])
+         //
+         // = (200000 satoshi SMARTBIT * [22] - 200000 satoshi SMARTBIT * [17])
+         //   / ([22 / 10] *  [17 satoshi SMARTBIT / 600 satoshi CORE] - [17 satoshi SMARTBIT / 400 satoshi CORE])
+         //
+         // = (200000 satoshi SMARTBIT * [22 - 17])
+         //   / ([22 / 10] *  [17 satoshi SMARTBIT / 600 satoshi CORE] - [17 satoshi SMARTBIT / 400 satoshi CORE])
+         //
+         // = (200000 satoshi CORE * [5]) / ([22 / 10] *  [17 / 600] - [17 / 400])
+         //
+         // = (1000000 satoshi CORE) / ([22 / 10] *  [17 / 600] - [17 / 400])
+         //
+         // ~= (1000000 satoshi CORE) / (0.0198333333333) ~= 50420168.0757 satoshi CORE
+         //
+         // ~= rounded up to 50420169 satoshi CORE = 504.20169 CORE
+         // const asset expected_max_amount_to_sell = core.amount(50420169);
+         // match() is calculating 50420189 CORE
+
+         // Per BSIP38, the expected amount to cover from the call order
+         //
+         // max_debt_to_cover = max_amount_to_sell * match_price
+         //
+         // which is adjusted to
+         //
+         // max_debt_to_cover = max_amount_to_sell * call_pays_price
+
+         // Therefore the
+         //
+         // = (1000000 satoshi CORE) / ([22 / 10] *  [17 / 600] - [17 / 400]) * (17 satoshi SMARTBIT / 600 satoshi CORE)
+         //
+         // ~= 50420168.0757 satoshi CORE * (17 satoshi SMARTBIT / 600 satoshi CORE)
+         //
+         // ~= 1428571.42881 satoshi SMARTBIT rounded down to 1428571 satoshi SMARTBIT = 142.8571 SMARTBIT
+         // ~= 1428571.42881 satoshi SMARTBIT rounded up to 1428572 satoshi SMARTBIT = 142.8572 SMARTBIT
+         const asset expected_max_debt_to_cover = smartbit.amount(1428572);
+
+         // Payment to limit order = X/match_price = X*(MSSR-MCFR)/feed_price
+         // = 1428572 satoshi SMARTBIT * (580 satoshi CORE / 17 satoshi SMARTBIT)
+         // = 48739515.2941 satoshi CORE rounded up to 48739516 satoshi CORE = 487.39516 CORE
+         // Margin call should exchange the filled debt (X) for X*(MSSR-MCFR)/feed_price
+         const asset expected_payment_to_alice_core = core.amount(48739516);
+
+         // Caluclated the expected payment in collateral by the call order
+         // to fulfill the (complete or partial) filling of the margin call.
+         //
+         // The expected payment is not necessarily equal to BSIP38's max_amount_to_sell.
+         // It should be calculated base on the amount paid to the limit order (X), the settlement price,
+         // and the MSSR.
+         //
+         // Expected payment by call order = X*MSSR/settlement_price
+         // Expected payment by call order = 1428572 satoshi SMARTBIT * (600 satoshi CORE / 17 satoshi SMARTBIT)
+         // = 1428572 * 600 satoshi CORE / 17
+         // = 50420188.2353 satoshi CORE rounding up to 50420189 satoshi CORE = 504.20189 CORE
+         const asset expected_payment_from_bob_core = core.amount(50420189);
+
+         // The call order MUST ALSO pay the margin call fee
+         // Expected fee = payment by call order - payment to limit order
+         const asset expected_margin_call_fee = expected_payment_from_bob_core - expected_payment_to_alice_core;
+
+         // Check Alice's balances
+         BOOST_CHECK_EQUAL(get_balance(alice, smartbit), 0);
+         BOOST_CHECK_EQUAL(get_balance(alice, core),
+                           alice_initial_core.amount.value + expected_payment_to_alice_core.amount.value);
+
+         // Alice's limit order should be open because of its partial filling
+         BOOST_CHECK(db.find(alice_order_id));
+
+         // Check Alice's limit order
+         // The amount of smart asset available for sale should be reduced by the amount paid to Bob's margin call
+         limit_order_object alice_limit_order = alice_order_id(db);
+         asset expected_alice_remaining_smart_for_sale = alice_debt_to_sell - expected_max_debt_to_cover;
+         BOOST_CHECK_EQUAL(alice_limit_order.amount_for_sale().amount.value,
+                           expected_alice_remaining_smart_for_sale.amount.value);
+         // Alice's limit order's price should be unchanged by the margin call
+         BOOST_CHECK(alice_limit_order.sell_price == alice_sell_op.get_price());
+
+         // Bob's debt position should be open because of its partial filling
+         BOOST_CHECK(db.find(bob_call_id));
+
+         // Check Bob's debt position
+         BOOST_CHECK_EQUAL(bob_call_id(db).debt.value,
+                           bob_initial_smart.amount.value - expected_max_debt_to_cover.amount.value);
+         BOOST_CHECK_EQUAL(bob_call_id(db).collateral.value,
+                           bob_initial_core.amount.value - expected_payment_to_alice_core.amount.value -
+                           expected_margin_call_fee.amount.value);
+
+         // Check Bob's balances
+         // Bob should have no debt asset
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), smartbit_id(db)), 0);
+         // Bob should NOT have collected the balance of his collateral after the margin call
+         // because the debt position is still open
+         BOOST_CHECK_EQUAL(get_balance(bob_id(db), core_id(db)), 0);
+
+         // Check the asset owner's accumulated asset fees
+         BOOST_CHECK(smartbit.dynamic_asset_data_id(db).accumulated_fees == 0);
+         BOOST_CHECK_EQUAL(smartbit.dynamic_asset_data_id(db).accumulated_collateral_fees.value,
+                           expected_margin_call_fee.amount.value);
+
+         // Check the fee of the fill operations for Alice and Bob
+         generate_block(); // To trigger db_notify() and record pending operations into histories
+         graphene::app::history_api hist_api(app);
+         vector <operation_history_object> histories;
+         const int fill_order_op_id = operation::tag<fill_order_operation>::value;
+
+         // Check Alice's history
+         histories = hist_api.get_account_history_operations(
+                 "alice", fill_order_op_id, operation_history_id_type(), operation_history_id_type(), 100);
+         // There should be one fill order operation
+         BOOST_CHECK_EQUAL(histories.size(), 1);
+         // Alice's fill order for her limit order should have zero fee
+         fill_order_operation alice_fill_op = histories.front().op.get<fill_order_operation>();
+         BOOST_CHECK(alice_fill_op.fee == asset(0));
+         // Bob's fill order's fill price should equal the expected match price
+         BOOST_CHECK(~alice_fill_op.fill_price == expected_match_price);
+
+         // Check Bob's history
+         histories = hist_api.get_account_history_operations(
+                 "bob", fill_order_op_id, operation_history_id_type(), operation_history_id_type(), 100);
+         // There should be one fill order operation
+         BOOST_CHECK_EQUAL(histories.size(), 1);
+         // Bob's fill order for his margin call should have a fee equal to the margin call fee
+         fill_order_operation bob_fill_op = histories.front().op.get<fill_order_operation>();
+         BOOST_CHECK(bob_fill_op.fee == expected_margin_call_fee);
+         // Bob's fill order's fill price should equal the expected match price
+         BOOST_CHECK(~bob_fill_op.fill_price == expected_match_price);
+
+      } FC_LOG_AND_RETHROW()
+   }
+
+
+   /**
     * Test a simple scenario of a Complete Fill of a Call Order as a Taker after HF
     *
     * 0. Advance to HF
