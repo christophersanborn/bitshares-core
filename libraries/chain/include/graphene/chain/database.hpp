@@ -693,34 +693,3 @@ namespace graphene { namespace chain {
    }
 
 } }
-
-namespace graphene {
-   namespace chain {
-      namespace detail {
-         // TODO: BSIP74: Move calculate_collateral() near get_max_squeeze_ratio() or vice versa
-         /**
-          * @brief Calculate the collateral from filled_debt * ratio_divisor / price
-          * @param debt The amount of debt filled
-          * @param ratio_divisor Ratio divisor of the price
-          * @param reference_price Reference price
-          * @returns The collateral corresponding from the reference price and the divisor
-          */
-         asset calculate_collateral(const asset &filled_debt,
-                                    const uint16_t &ratio_divisor,
-                                    const price &reference_price);
-
-         /**
-          * @brief Calculate the collateral = filled_debt / (price * ratio_dividend / ratio_divisor)
-          * @param debt The amount of debt filled
-          * @param ratio_divident Ratio dividend of the price
-          * @param ratio_divisor Ratio divisor of the price
-          * @param reference_price Reference price
-          * @returns The collateral corresponding from the reference price, dividend, and divisor
-          */
-         asset calculate_collateral(const asset &filled_debt,
-                                    const price &reference_price,
-                                    const uint16_t &ratio_dividend, const uint16_t &ratio_divisor);
-      }
-
-   }
-}
