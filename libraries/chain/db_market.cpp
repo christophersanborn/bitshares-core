@@ -717,16 +717,15 @@ int database::match( const limit_order_object& bid, const call_order_object& ask
    }
    order_pays = call_receives;
 
-   int result = 0;
-   result |= fill_limit_order( bid, order_pays, order_receives, cull_taker, match_price, false );
-
-   // BSIP74: Difference between what the call order pays and the limit order receives is the margin call fee
-   // that is paid by the call order owner.
+   // Compute margin call fee (BSIP74). Difference between what the call order pays and the limit order
+   // receives is the margin call fee that is paid by the call order owner to the asset issuer.
    // Margin call fee should equal = X*MCFR/settle_price, to within rounding error.
    FC_ASSERT(call_pays >= order_receives);
    const asset& margin_call_fee = call_pays - order_receives;
 
-   result |= fill_call_order( ask, call_pays, call_receives, match_price, true, margin_call_fee ) << 1; // the call order is maker
+   int result = 0;
+   result |= fill_limit_order( bid, order_pays, order_receives, cull_taker, match_price, false ); // taker
+   result |= fill_call_order( ask, call_pays, call_receives, match_price, true, margin_call_fee ) << 1; // maker
    // result can be 0 when call order has target_collateral_ratio option set.
 
    return result;
